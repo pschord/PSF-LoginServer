@@ -1,7 +1,7 @@
 // Copyright (c) 2016 PSForever.net to present
 import java.net.{InetAddress, InetSocketAddress}
 
-import akka.actor.{Actor, ActorRef, Cancellable, MDCContextAware}
+import akka.actor.{Actor, ActorIdentity, ActorRef, Cancellable, Identify, MDCContextAware}
 import net.psforever.packet.{PlanetSideGamePacket, _}
 import net.psforever.packet.control._
 import net.psforever.packet.game._
@@ -9,6 +9,7 @@ import scodec.Attempt.{Failure, Successful}
 import scodec.bits._
 import org.log4s.MDC
 import MDCContextAware.Implicits._
+import ServiceManager.Lookup
 import net.psforever.types.ChatMessageType
 
 class WorldSessionActor extends Actor with MDCContextAware {
@@ -19,6 +20,9 @@ class WorldSessionActor extends Actor with MDCContextAware {
   var sessionId : Long = 0
   var leftRef : ActorRef = ActorRef.noSender
   var rightRef : ActorRef = ActorRef.noSender
+
+  var serviceManager = Actor.noSender
+  var chatService = Actor.noSender
 
   var clientKeepAlive : Cancellable = null
 
@@ -35,13 +39,18 @@ class WorldSessionActor extends Actor with MDCContextAware {
       leftRef = sender()
       rightRef = right.asInstanceOf[ActorRef]
 
+      ServiceManager.serviceManager ! Lookup("chat")
+
       context.become(Started)
-    case _ =>
-      log.error("Unknown message")
+    case msg =>
+      log.error(s"Unknown message ${msg}")
       context.stop(self)
   }
 
   def Started : Receive = {
+    case ServiceManager.LookupResult(endpoint) =>
+      chatService = endpoint
+      log.debug("Got chat service " + endpoint)
     case ctrl @ ControlPacket(_, _) =>
       handlePktContainer(ctrl)
     case game @ GamePacket(_, _, _) =>
@@ -49,6 +58,8 @@ class WorldSessionActor extends Actor with MDCContextAware {
       // temporary hack to keep the client from disconnecting
     case PokeClient() =>
       sendResponse(PacketCoding.CreateGamePacket(0, KeepAliveMessage(0)))
+    case ChatMessage(to, from, data) =>
+      sendResponse(PacketCoding.CreateGamePacket(0, ChatMsg(ChatMessageType.CMT_OPEN, true, from, data, None)))
     case default => failWithError(s"Invalid packet class received: $default")
   }
 
@@ -171,6 +182,8 @@ class WorldSessionActor extends Actor with MDCContextAware {
 
               sendResponse(PacketCoding.CreateGamePacket(0, SetCurrentAvatarMessage(PlanetSideGUID(guid),0,0)))
 
+              chatService ! ChatService.Join("local")
+
               import scala.concurrent.duration._
               import scala.concurrent.ExecutionContext.Implicits.global
               clientKeepAlive = context.system.scheduler.schedule(0 seconds, 500 milliseconds, self, PokeClient())
@@ -202,6 +215,8 @@ class WorldSessionActor extends Actor with MDCContextAware {
         sendResponse(DropCryptoSession())
         sendResponse(DropSession(sessionId, "user quit"))
       }
+
+      chatService ! ChatService.NewMessage("myname", msg)
 
       // TODO: Depending on messagetype, may need to prepend sender's name to contents with proper spacing
       // TODO: Just replays the packet straight back to sender; actually needs to be routed to recipients!
